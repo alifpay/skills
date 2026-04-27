@@ -1,6 +1,6 @@
 ---
 name: review-error-classification
-description: Review backend error handling in transactional/financial flows to prevent money loss from misclassified failures. Checks that infrastructure errors (Redis, RabbitMQ, Kafka, database, HTTP timeout, upstream service failure, context cancellation) are NOT converted into final FAILED status, that unknown/transient errors leave the transaction in PENDING/PROCESSING with alerting, that the response returned to the caller matches the locally-committed state (never reply SUCCESS when the local commit or downstream confirmation is missing), and that a status-check precedes any retry or mark-failed. Trigger when reviewing catch blocks, error branches, status transitions, response writers, or any code path that updates transaction state in payment, wallet, ledger, or transactional services.
+description: Review backend error handling in transactional/financial flows to prevent money loss from misclassified failures. Checks that infrastructure errors (Redis, RabbitMQ, Kafka, database, HTTP timeout, upstream service failure, context cancellation) are NOT converted into final FAILED status, that unknown/transient errors leave the transaction in PENDING/PROCESSING with alerting, that the response returned to the caller matches the locally-committed state (never reply SUCCESS when the local commit or downstream confirmation is missing), that a status-check precedes any retry or mark-failed, and that a failure to write to the local database trips an inbound circuit breaker (halts new transactional traffic) and pages on-call rather than marking the row FAILED. Trigger when reviewing catch blocks, error branches, status transitions, response writers, DB-write error handling, or any code path that updates transaction state in payment, wallet, ledger, or transactional services.
 ---
 
 # Error Classification Review
@@ -43,6 +43,51 @@ Rules:
 - [ ] A default / catch-all Unknown handler that emits a single generic alert is a red flag — it means sub-kinds are being lost at the point of classification.
 - [ ] Circuit breaker policy may differ per sub-kind: a sustained rate of `null_status` / `unparseable` often indicates a provider deploy or contract drift and should trip the breaker faster than raw network timeouts.
 
+## Local DB failure — halt new traffic, not just alert
+
+A failure to commit to **your own** database is structurally different from a failure to reach a provider. The provider path has a defined recovery (PROCESSING + status-check + reconcile). A failed local commit means the source of truth is unreachable: you cannot honor *persist-before-side-effects* (see `review-transaction-model`), you cannot record what you just attempted, and every next inbound transaction will hit the same wall. The correct response is **fail-stop on the inbound side**.
+
+### Rules
+
+- [ ] On a DB-write failure on a transactional path, the row is **not** transitioned to `FAILED` — same rule as for any other infra error. It stays `PROCESSING`, or was never persisted in the first place (which the alert + post-incident reconciliation must catch).
+- [ ] DB-write failure trips an **inbound circuit breaker** on transactional endpoints: subsequent transactional requests are rejected with a clear "service degraded" status (e.g. HTTP 503 with `Retry-After`) until the breaker closes. Read-only / status-check / reconciliation / back-office paths stay open so on-call can see in and drain backlog from the outside.
+- [ ] On-call **pages immediately** on the first DB-write failure on a transactional path — not on a per-minute aggregate, not buffered. Money paths cannot wait for an aggregation window.
+- [ ] The breaker has both an **automatic close criterion** (e.g. N consecutive successful writes on a probe path within a window) and a **manual override**, so operators can force open or force closed.
+- [ ] After the breaker closes, a **runbook exists** for finding rows left mid-flight, comparing each against any external side effect that may have started, and resolving via reconciliation.
+- [ ] DB failures are labelled distinctly in metrics + alerts: `db_connection_refused`, `db_timeout`, `db_deadlock`, `db_constraint_violation`. A unique-constraint violation is *idempotency working as designed* and must not trip the breaker; a connection failure must.
+
+### Red flags
+
+- [ ] DB error in a transactional handler caught and returned as a generic 500 — no page, no breaker, no row-state guarantee; the next request hits the same wall
+- [ ] DB-write failure transitions the row to `FAILED` (same class as Redis-error-as-FAILED — see incident at top of skill)
+- [ ] Handler proceeds to call the provider after the local persist failed — violates persist-before-side-effects (see `review-transaction-model`)
+- [ ] Single generic "DB error" alert with no separation between connection failure / timeout / deadlock / constraint violation — operator cannot decide what to do
+- [ ] Inbound breaker that closes purely on a wall-clock timer with no success-probe — re-opens the gate while the DB is still degraded
+- [ ] Inbound breaker that also blocks the status-check / reconciliation / back-office paths — operators lose the ability to drain backlog
+- [ ] Constraint-violation errors trip the breaker — every legitimate idempotent retry shuts down inbound traffic
+
+### Example
+
+**Wrong** — DB error swallowed, request continues to the provider; inbound stays open and the next request hits the same failure:
+
+```go
+if err := db.Save(&tx); err != nil {
+    log.Error("save failed", err)            // ❌ no page, no breaker
+}
+resp, _ := provider.Charge(...)              // ❌ side effect with no persisted row
+return resp
+```
+
+**Right** — DB-write failure pages, trips inbound breaker, refuses to call the provider:
+
+```go
+if err := db.Save(srvCtx, &tx); err != nil {
+    alerts.Page("db_write_failed", classify(err), tx.ID, err)
+    inboundBreaker.RecordFailure()
+    return ErrServiceDegraded                // 503 + Retry-After, no provider call
+}
+```
+
 ## Red flags to catch during review
 
 - [ ] `catch` / `if err != nil` / `except` branch on **Redis, RabbitMQ, Kafka, database, HTTP client, gRPC** that sets status to `FAILED` / `CANCELED` / any final state
@@ -52,6 +97,7 @@ Rules:
 - [ ] Retry loop on Unknown / unparseable responses (should be circuit breaker, not retry — retries can create duplicates)
 - [ ] No status-check call before retry or mark-failed
 - [ ] Infra error path only logs — no alert, no row left for manual reconciliation
+- [ ] DB-write failure on a transactional path that does NOT page on-call AND does NOT trip an inbound circuit breaker — the next request hits the same wall and unresolved `PROCESSING` rows pile up (see **Local DB failure — halt new traffic, not just alert**)
 - [ ] `null` / empty / missing response status lumped with `timeout` into one generic "error" / "unknown_error" label in logs, metrics, or alerts — each Unknown sub-kind must have its own label (see **Unknown has named sub-kinds**)
 - [ ] Generic `default:` / `else:` branch catches every non-success case and produces one alert — sub-kinds are lost at classification time
 - [ ] `null` status silently coerced to `FAILED` or `APPROVED` — must be `Unknown`, status-check, alert
@@ -67,26 +113,28 @@ Rules:
 1. Persist the transaction row with status `NEW`/`PROCESSING` **before** any outbound call.
 2. Generate and persist an idempotency key before the outbound call; send it **byte-identical** on every attempt. Never append a random suffix / timestamp / counter to the key on retry — that makes each retry a new transaction to the provider and causes double-charge (see `review-external-api` → **Idempotency key stability across retries**).
 3. On infra error, timeout, or unknown response: **leave status as `PROCESSING`**, enqueue a status-check job, optionally open a circuit breaker. Do not mark `FAILED`.
-4. Only move `PROCESSING → APPROVED / FAILED` on:
+4. On a failure to write to your own DB on a transactional path: keep the row out of any final state, do **not** call the provider, page on-call immediately, and trip an **inbound circuit breaker** that rejects new transactional requests until DB writes are healthy. Status-check / reconciliation / back-office paths stay open. (See **Local DB failure — halt new traffic, not just alert**.)
+5. Only move `PROCESSING → APPROVED / FAILED` on:
    - an authoritative response from the provider, OR
    - the result of an explicit status-check call, OR
    - an explicit back-office/manual reconciliation action.
-5. Response to the caller must reflect the locally-committed state. If the commit did not succeed, the response cannot be `SUCCESS`.
-6. Isolate rollback/cancel logic in a separate handler.
-7. Use a server-owned context (not the inbound request context) for DB and downstream calls.
-8. Alert on every Unknown / Pending branch and leave a reconciliation record.
+6. Response to the caller must reflect the locally-committed state. If the commit did not succeed, the response cannot be `SUCCESS`.
+7. Isolate rollback/cancel logic in a separate handler.
+8. Use a server-owned context (not the inbound request context) for DB and downstream calls.
+9. Alert on every Unknown / Pending branch and leave a reconciliation record.
 
 ## PR review checklist
 
 1. Grep the diff for `redis`, `rabbit`, `kafka`, `http.Client`, DB driver calls, `ctx.Err`, `DeadlineExceeded` inside any transactional path.
 2. For every error branch that touches transaction status, ask: *"is the outcome confirmed by the authoritative source?"* If not → the branch must not write a final status.
-3. Locate every response writer (JSON reply, gRPC return, event publish). Confirm the local commit happened first and that the response value is derived from the committed row, not from an in-memory flag.
-4. Inspect the state machine. List every transition ending in a final state and confirm each has an authoritative-source guard.
-5. Check alerting: every Pending / Unknown branch must produce an alert + durable record. Every **Unknown sub-kind** (`null_status`, `empty_body`, `unparseable`, `unknown_enum`, `unknown_id`, `unexpected_code`, `signature_fail`) must have its own distinct alert name and metric label — a single generic "unknown_error" alert is a finding.
-6. Grep the response-classification code for conditions like `resp.Status == nil`, `resp.Code == ""`, `len(body) == 0`, parser `!ok` / error-decode branches. Confirm each routes to its **named** sub-kind, and not into the same branch as `timeout` / `DeadlineExceeded`.
-7. Check idempotency: the outbound call must carry a key that is persisted before the call and reused on retry.
-8. Check context ownership: DB / broker / provider calls must not use the inbound-request context.
-9. Check the rollback handler: is it separate from the main request handler? Does it leave the transaction in a consistent state on partial failure?
+3. Find the DB-write error branch on every transactional path. Confirm: (a) the row is not moved to `FAILED`, (b) the handler does not proceed to a provider call after the local persist failed, (c) an immediate page is raised, (d) an inbound circuit breaker is tripped (or there is a documented reason it is not). If any of those is missing → block.
+4. Locate every response writer (JSON reply, gRPC return, event publish). Confirm the local commit happened first and that the response value is derived from the committed row, not from an in-memory flag.
+5. Inspect the state machine. List every transition ending in a final state and confirm each has an authoritative-source guard.
+6. Check alerting: every Pending / Unknown branch must produce an alert + durable record. Every **Unknown sub-kind** (`null_status`, `empty_body`, `unparseable`, `unknown_enum`, `unknown_id`, `unexpected_code`, `signature_fail`) must have its own distinct alert name and metric label — a single generic "unknown_error" alert is a finding.
+7. Grep the response-classification code for conditions like `resp.Status == nil`, `resp.Code == ""`, `len(body) == 0`, parser `!ok` / error-decode branches. Confirm each routes to its **named** sub-kind, and not into the same branch as `timeout` / `DeadlineExceeded`.
+8. Check idempotency: the outbound call must carry a key that is persisted before the call and reused on retry.
+9. Check context ownership: DB / broker / provider calls must not use the inbound-request context.
+10. Check the rollback handler: is it separate from the main request handler? Does it leave the transaction in a consistent state on partial failure?
 
 ## Example — wrong vs right (Go)
 

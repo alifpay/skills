@@ -1,6 +1,6 @@
 ---
 name: review-external-api
-description: Review backend code that integrates with external/third-party APIs (payment providers, banks, KYC, card networks, crypto exchanges, SMS/OTP, any outbound HTTP/gRPC to a system you do not own). Checks planning of failure modes, idempotency, timeout and retry strategy, response code classification, duplicate-transaction prevention, two-step auth+confirm flows, amount validation between auth and confirm, transactional-result guarantees, status-check before retry/mark-failed/refund, response schema validation and contract-drift detection (silent type changes, renamed fields, new enum values), refund/reversal guards (never refund on parse error or on self-inferred failure), contract versioning, internal+external ID uniqueness, reconciliation, and deployment strategy for version bumps. Trigger when reviewing clients, adapters, SDKs, webhooks, response parsers, refund/reversal handlers, or any code that calls an external provider.
+description: Review backend code that integrates with external/third-party APIs (payment providers, banks, KYC, card networks, crypto exchanges, SMS/OTP, any outbound HTTP/gRPC to a system you do not own). Checks planning of failure modes, idempotency, timeout and retry strategy, response code classification, duplicate-transaction prevention, two-step auth+confirm flows, amount validation between auth and confirm, transactional-result guarantees, status-check before retry/mark-failed/refund, response schema validation and contract-drift detection (silent type changes, renamed fields, new enum values), refund/reversal guards (never refund on parse error or on self-inferred failure), contract versioning, internal+external ID uniqueness, reconciliation, and deployment of version bumps to a live integration (blue-green, staged rollout, shadow/parallel-run with no side effects, one-toggle rollback rehearsed in staging, stable idempotency-key format across the cutover, drain wait by oldest in-flight transaction, tightened reconciliation cadence). Trigger when reviewing clients, adapters, SDKs, webhooks, response parsers, refund/reversal handlers, release plans for integration bumps, or any code that calls an external provider.
 ---
 
 # External API Integration Review
@@ -123,6 +123,44 @@ A refund or reversal on the wrong trigger loses real money. These paths need str
 - [ ] Automated refund paths (e.g. "on failure, auto-refund") are disabled by default; enabling requires an explicit design review.
 - [ ] Every refund/reversal produces an alert + audit record with: trigger source, provider status at time of decision, and operator (or "system").
 
+## Deploying a version bump to a live integration
+
+Why: A live integration is part of your runtime contract with the provider. A version bump — yours, theirs, or both — can change response shape, error semantics, signing, ID format, or timing. A "deploy and watch" rollout converts every incompatibility into a user-impacting failure that costs real money to unwind. Money-moving integrations ship version bumps with a written release plan, a staged rollout, and a one-toggle rollback, every time.
+
+This applies whether the change is **on your side** (new client code, new parser, new request shape) or **on the provider's side** (the provider has announced a contract bump and you must integrate against it).
+
+### Rules
+
+- [ ] **Written release plan** in the PR or runbook: what changed (your side and provider's side), what can break, what dashboards to watch, what triggers rollback, who is on-call during the window. "Deploy and watch logs" is not a plan.
+- [ ] **Staged rollout** behind a feature flag or routing toggle: e.g. 1% → 10% → 50% → 100%, with a hold at each step long enough for the slowest provider response to come back at least 2× over (so a slow tail does not look like silence).
+- [ ] **Blue-green at the integration boundary**: old code path and new code path coexist and are switched by a config flip, not a redeploy. Both paths read/write the same DB and share the same idempotency-key space — see "External-ref / idempotency-key stability" below.
+- [ ] **Parallel-run / shadow comparison** for shape-changing bumps: route the same logical request through the new code path in shadow mode, compare its parsed result against the old path's result, fail rollout if responses diverge beyond an agreed threshold. **The shadow path produces zero side effects** — does not call the provider a second time, does not write a second outbox row, does not bill twice.
+- [ ] **Rollback is one toggle**, executable by on-call without a release engineer. Not "git revert and redeploy". Decision-to-rollback latency must be measured in seconds, not minutes.
+- [ ] **Rollback rehearsed in staging** within the last release cycle. An untested rollback fails at the moment it is needed.
+- [ ] **Pre-deploy gate**: contract / smoke test against the provider's sandbox passes on the new code against the new response shape (cross-reference: **Response contract validation and drift detection**).
+- [ ] **Post-deploy watch list** is identified before rollout: error rate, Unknown-sub-kind rates (`null_status`, `unparseable`, `unknown_enum` — see `review-error-classification`), p99 latency, reconciliation divergence count. Spike on any of these = stop rollout.
+- [ ] **Reconciliation cadence tightened** during the rollout window — divergence is expected to spike, so the reconciliation job runs more frequently and pages on threshold breach instead of waiting for the regular window.
+- [ ] **External-ref / idempotency-key format stable across the version boundary** unless renegotiated with the provider in writing. Changing the key format breaks matching for in-flight transactions and for historical reconciliation across the cutover.
+- [ ] **Drain wait before retiring the old path**: measured against the actual oldest `PROCESSING` row that started on the old code, not a wall-clock guess. Retries and status-checks for old-path transactions must keep working until that row resolves.
+- [ ] **Provider-side bumps**: confirm the switchover window with the provider in writing, schedule against it, and define handling for transactions that span the boundary (started on the old contract, expected to confirm on the new). Status-check responses across the cutover get explicit test coverage.
+- [ ] **Rollout scheduled inside the on-call coverage window**, not over a weekend or off-hours unless a dedicated on-call is assigned for the duration.
+
+### Red flags
+
+- [ ] Version bump shipped 100% of traffic in one deploy — no flag, no toggle, no staging fraction
+- [ ] Rollback plan is "git revert and redeploy" — latency too high for a money-moving path
+- [ ] No shadow / parallel-run for a response-shape change — first signal of incompatibility is a user-impacting failure
+- [ ] Shadow path that **calls the provider** (creates a second real charge per request) — turns the rollout itself into a double-charge incident
+- [ ] Watch dashboards not chosen pre-deploy — on-call has nothing concrete to read during the window
+- [ ] Old code path removed in the same deploy that adds the new one — no drain
+- [ ] Old code path retired by wall-clock timer instead of by oldest-`PROCESSING` age — in-flight transactions get stranded
+- [ ] Provider-side bump deployed without a written switchover window from the provider
+- [ ] External-ref / idempotency-key format changed silently at the version boundary, breaking match for in-flight transactions and for reconciliation across the cutover
+- [ ] Reconciliation cadence unchanged during rollout — divergence can build for hours before it is noticed
+- [ ] Rollback toggle exists but has not been exercised in staging in the current release cycle
+- [ ] Rollout scheduled outside the on-call coverage window, or with no named on-call for the duration
+- [ ] Pre-deploy contract test not run against the provider's sandbox on the new code
+
 ## Red flags to catch during review
 
 - [ ] Outbound call sent **before** persisting the transaction row — on failure you have no record to reconcile
@@ -147,7 +185,7 @@ A refund or reversal on the wrong trigger loses real money. These paths need str
 - [ ] Integration result not wrapped in a DB transaction — partial state possible on failure
 - [ ] No reconciliation job comparing local records with provider records
 - [ ] No alerting + manual-review record on Unknown responses
-- [ ] Version bump to an existing integration deployed without blue-green / staged rollout
+- [ ] Version bump to an existing integration deployed without blue-green / staged rollout, without a one-toggle rollback, without a shadow / parallel-run for shape changes, or without a tightened reconciliation cadence during the window (see **Deploying a version bump to a live integration**)
 - [ ] Cross-reference with `review-error-classification` — infra errors on the outbound call must not become final FAILED status
 
 ## What the code SHOULD do
@@ -164,7 +202,7 @@ A refund or reversal on the wrong trigger loses real money. These paths need str
 10. Run a periodic reconciliation job comparing local state vs. provider state; alert on divergence.
 11. Apply Circuit Breaker to Unknown responses; do not retry.
 12. Keep refund / reversal in a separate handler with its own idempotency key; refund is triggered only by authoritative failure or status-check result, never by a self-inferred failure.
-13. Deploy version bumps via blue-green or staged rollout.
+13. Deploy version bumps via blue-green / staged rollout with a written release plan, a one-toggle rollback, a shadow / parallel-run for shape changes (no side effects on the shadow path), a stable external-ref / idempotency-key format across the cutover, a tightened reconciliation cadence during the window, and a drain wait gated on the oldest in-flight `PROCESSING` row before retiring the old path.
 
 ## PR review checklist
 
@@ -182,4 +220,4 @@ A refund or reversal on the wrong trigger loses real money. These paths need str
 9. Confirm the local DB commit and the outbound-call result are in a single transactional boundary.
 10. Is there a reconciliation job? Check its schedule and what it compares.
 11. Is there a contract / smoke test against the provider's sandbox? When was it last updated?
-12. For a version change to an existing integration: confirm rollout plan.
+12. For a version change to an existing integration (yours or the provider's): walk **Deploying a version bump to a live integration** top-to-bottom — written release plan, staged rollout, shadow / parallel-run with no side effects, one-toggle rollback rehearsed in staging, stable external-ref / idempotency-key format, tightened reconciliation cadence, drain wait by oldest `PROCESSING` age, on-call coverage. Any missing item → block.

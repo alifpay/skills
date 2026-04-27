@@ -14,6 +14,7 @@ Message brokers make systems scalable but they break naive transactional thinkin
 - [ ] DB write happens **after** the publish — on DB failure a message exists for a transaction that does not
 - [ ] Consumer has no idempotency check; processes the same message twice and double-spends
 - [ ] No unique-per-client request ID persisted in the Inbox before processing
+- [ ] Inbox dedup by message ID alone with no body-hash check — same ID + different payload silently accepted, defeating idempotency (see `review-sync-transactional` → **Server-side idempotency on transactional intake**)
 - [ ] Consumer processes a message with no freshness check — a message from months ago is executed as if fresh
 - [ ] Consumer writes the transaction status with a blind `UPDATE ... WHERE id = ?` (no current-state guard) — **a late / replayed / out-of-order message can overwrite a final status, and if a refund path is wired to the status change, money is returned on a successful transaction.** Updates from consumers must be guarded transitions with stale-timestamp rejection (see `review-transaction-model` → Final-state immutability).
 - [ ] Consumer writing to a final-state row does not route to reconciliation — silently drops or silently overwrites
@@ -53,7 +54,7 @@ Messages and events are an API. Breaking a message schema in place breaks every 
 ## What the code SHOULD do
 
 1. Use the **Outbox pattern** on producers: the DB write and an `outbox` row are committed in a single local transaction. A separate relay process publishes from the outbox with retry.
-2. Use the **Inbox pattern** on consumers: persist the message's unique ID before processing; reject on duplicate; ack only after the DB commit.
+2. Use the **Inbox pattern** on consumers: persist the message's unique ID **and a hash of the message body** before processing; reject on duplicate ID with matching body; on same-ID + different-body, reject and alert (a duplicate ID with a different payload is a producer bug or replay attempt — never a normal case). Ack only after the DB commit. (See `review-sync-transactional` → **Server-side idempotency on transactional intake** for the full body-hash rationale.)
 3. Require a unique client-provided request ID on every transactional message; enforce uniqueness at the DB level.
 4. Require a `transaction_date` / `valid_until` field; reject stale messages with a clear "expired" reason (do not silently drop).
 5. Configure durable queues, persistent messages, appropriate retention / TTL, and a Dead Letter target.
